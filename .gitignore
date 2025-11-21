@@ -1,0 +1,9 @@
+# Virtual muhit fayllarini e'tiborsiz qoldirish
+venv/
+.venv/
+
+# Pythonga oid fayllar va papkalar
+__pycache__/
+*.pyc
+*.pyd
+.env
