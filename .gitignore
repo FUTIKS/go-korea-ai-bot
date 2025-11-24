@@ -1,9 +1,31 @@
-# Virtual muhit fayllarini e'tiborsiz qoldirish
-venv/
-.venv/
-
-# Pythonga oid fayllar va papkalar
-__pycache__/
-*.pyc
-*.pyd
+# Environment files
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Database
+*.json
+users_data.json
+referral_data.json
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

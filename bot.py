@@ -1,24 +1,14 @@
 import logging
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import json
 import os
-from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from collections import defaultdict
 
-from data import Q_A_DATA, PRICES_INFO, UNIVERSITY_INFO, STUDY_INFO
-
-# .env fayldan tokenni yuklash (XAVFSIZLIK!)
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-
-if not TOKEN:
-    raise ValueError("⚠️ BOT_TOKEN topilmadi! .env faylni tekshiring.")
-
-# Rasmlar papkasi manzili
-IMAGE_DIR = 'images'
-
-# Har bir chat uchun oxirgi bot xabar ID sini saqlash
-last_bot_messages = defaultdict(list)
+from config import BOT_TOKEN, REQUIRED_CHANNEL, CONTACT_INFO, IMAGE_DIR, USER_DATA_FILE, REFERRAL_DATA_FILE, REFERRAL_BONUS
+from database.universities_data import UNIVERSITIES
+from languages import uz_latin, uz_cyrillic, english, korean
+from utils.helpers import is_subscribed_to_channel, generate_referral_code, format_contact_info
 
 # Loglarni sozlash
 logging.basicConfig(
@@ -27,105 +17,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Har bir user uchun oxirgi xabar ID
+last_messages = {}
 
-def get_main_keyboard():
-    """Asosiy menyu tugmalarini yaratish."""
-    keyboard = [
-        [
-            InlineKeyboardButton("💰 Narxlar va To'lovlar", callback_data='info_prices'),
-            InlineKeyboardButton("🎓 Universitetlar", callback_data='info_universities')
-        ],
-        [
-            InlineKeyboardButton("🇰🇷 Til Kurslari/Hujjatlar", callback_data='info_study'),
-            InlineKeyboardButton("📞 Aloqa", callback_data='info_contact')
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+# User ma'lumotlarini saqlash
+user_data = {}
+referral_data = {}
 
+# Tillarni yuklaash
+LANGUAGE_MODULES = {
+    "uz": uz_latin,
+    "uzb": uz_cyrillic,
+    "en": english,
+    "ko": korean
+}
 
-def get_university_keyboard():
-    """Universitetlar ro'yxati tugmalarini yaratish."""
-    keyboard = []
-    for uni_name in UNIVERSITY_INFO.keys():
-        keyboard.append([InlineKeyboardButton(uni_name, callback_data=f'uni_{uni_name}')])
+def load_user_data():
+    """User va referal ma'lumotlarini yuklash"""
+    global user_data, referral_data
     
-    keyboard.append([InlineKeyboardButton("⬅️ Asosiy Menyu", callback_data='start')])
-    return InlineKeyboardMarkup(keyboard)
-
-
-def format_uni_info(uni_name):
-    """Bitta universitet haqidagi ma'lumotni formatlash."""
-    uni_data = UNIVERSITY_INFO[uni_name]
-    response = f"🎓 **{uni_name} Universiteti haqida ma'lumot:**\n\n"
-    response += f"📍 Shahar: {uni_data['shahar']}\n"
-    response += f"💵 Kontrakt Narxi (1 Semestr): **{uni_data['narx']}**\n"
-    response += f"✍️ Tavsif: {uni_data['tavsif']}\n"
-    response += f"✨ Afzalligi: {uni_data['afzallik']}\n"
-    response += f"🛂 Qabul turi: **{uni_data['qabul_turi']}**\n"
-    return response
-
-
-def format_prices_info():
-    """Narxlar haqidagi ma'lumotni formatlash."""
-    price_info = PRICES_INFO["asosiy_konsalting"]
+    if os.path.exists(USER_DATA_FILE):
+        with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
+            user_data = json.load(f)
     
-    response = "💳 **Go Korea Konsalting Xizmatlari Narxlari:**\n\n"
-    response += "1. **Oldindan To'lov (Shartnoma va Hujjatlar uchun):**\n"
-    response += f"   Summasi: **{price_info['oldindan_tolov']}**\n"
-    response += f"   Shartlari: {price_info['oldindan_shart']}\n\n"
+    if os.path.exists(REFERRAL_DATA_FILE):
+        with open(REFERRAL_DATA_FILE, 'r', encoding='utf-8') as f:
+            referral_data = json.load(f)
+
+def save_user_data():
+    """User ma'lumotlarini saqlash"""
+    with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(user_data, f, ensure_ascii=False, indent=2)
     
-    response += "2. **Oxirgi To'lov (Firma Xizmati uchun):**\n"
-    response += f"   Summasi: **{price_info['oxirgi_tolov']}**\n"
-    response += f"   Shartlari: {price_info['oxirgi_shart']}\n\n"
-    
-    response += f"ℹ️ **Konsalting Xizmatiga Kiritilganlar:** {price_info['tavsif']}"
-    return response
+    with open(REFERRAL_DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(referral_data, f, ensure_ascii=False, indent=2)
+
+def get_user_language(user_id):
+    """User tilini olish (default: uz)"""
+    return user_data.get(str(user_id), {}).get('language', 'uz')
+
+def set_user_language(user_id, lang):
+    """User tilini o'rnatish"""
+    if str(user_id) not in user_data:
+        user_data[str(user_id)] = {}
+    user_data[str(user_id)]['language'] = lang
+    save_user_data()
+
+def get_text(user_id, key):
+    """Tilga mos matnni olish"""
+    lang = get_user_language(user_id)
+    module = LANGUAGE_MODULES.get(lang, uz_latin)
+    return module.TEXTS.get(key, key)
 
 
-def format_study_info():
-    """Til kurslari haqidagi ma'lumotni formatlash."""
-    course_info = STUDY_INFO["til_kursi"]
-    hujjat_list = "\n".join(STUDY_INFO['hujjat_talablari'])
-    
-    response = "🇰🇷 **Koreys Tili Kurslari (D-4 Viza):**\n\n"
-    response += f"Davomiylik: **{course_info['davomiylik']}**\n"
-    response += f"Boshlanish sanalari: {course_info['boshlanish']}\n"
-    response += f"Dars vaqti: {course_info['dars_vaqti']}\n"
-    response += f"Narx (Namuna): {course_info['narx']}\n\n"
-    
-    response += "📄 **Asosiy Hujjat Talablari (Viza uchun):**\n"
-    response += hujjat_list
-    
-    return response
+# ============ XABAR BOSHQARUVI - TUZATILGAN ============
 
+async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Faqat oxirgi bot xabarini o'chirish"""
+    if chat_id in last_messages:
+        try:
+            
+            logger.info(f"✅ Eski xabar o'chirildi: {last_messages[chat_id]}")
+        except Exception as e:
+            logger.debug(f"Xabar o'chirilmadi: {e}")
 
-async def delete_all_bot_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Saqlangan BARCHA eski bot xabarlarini o'chirish."""
-    if chat_id in last_bot_messages:
-        deleted = 0
-        for msg_id in last_bot_messages[chat_id]:
-            try:
-                await context.bot.delete_message(chat_id, msg_id)
-                deleted += 1
-            except Exception as e:
-                logger.debug(f"Xabar {msg_id} o'chirilmadi: {e}")
-        
-        # Ro'yxatni tozalash
-        last_bot_messages[chat_id].clear()
-        logger.info(f"✅ {deleted} ta eski xabar o'chirildi (Chat: {chat_id})")
-
-
-async def send_and_track_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, 
-                                 reply_markup=None, photo_path=None):
-    """Yangi xabar yuborish va uning ID sini saqlash."""
+async def send_message_smart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, 
+                             reply_markup=None, photo_path=None):
+    """Yangi xabar yuborish - eskisini o'chirib"""
     try:
-        # Avval BARCHA eski xabarlarni o'chirish
-        await delete_all_bot_messages(context, chat_id)
+        # Eski xabarni o'chirish (agar yangi xabar yuborilishi aniq bo'lsa)
+        # O'chirishni bu joydan olib tashladim, chunki u keyingi qadamda amalga oshirilishi kerak.
+        # Lekin sizning kodingizda bor edi, shuning uchun qaytadan qo'shaman
+        await delete_previous_message(context, chat_id)
         
-        # Yangi xabar yuborish
         if photo_path and os.path.exists(photo_path):
             with open(photo_path, 'rb') as photo_file:
-                sent_message = await context.bot.send_photo(
+                sent = await context.bot.send_photo(
                     chat_id=chat_id,
                     photo=photo_file,
                     caption=text,
@@ -133,199 +100,417 @@ async def send_and_track_message(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                     reply_markup=reply_markup
                 )
         else:
-            sent_message = await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
         
-        # Yangi xabar ID sini saqlash
-        if sent_message:
-            last_bot_messages[chat_id].append(sent_message.message_id)
-            logger.info(f"📤 Yangi xabar yuborildi: {sent_message.message_id}")
-        
-        return sent_message
+        # Yangi xabar ID ni saqlash
+        last_messages[chat_id] = sent.message_id
+        logger.info(f"📤 Yangi xabar: {sent.message_id}")
+        return sent
         
     except Exception as e:
         logger.error(f"Xabar yuborishda xatolik: {e}")
         return None
 
 
-# ----------------- COMMAND HANDLERS -----------------
+# ============ KEYBOARDS ============
+
+def get_language_keyboard():
+    """Til tanlash tugmalari"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data='lang_uz'),
+            InlineKeyboardButton("🇺🇿 Ўзбекча", callback_data='lang_uzb')
+        ],
+        [
+            InlineKeyboardButton("🇬🇧 English", callback_data='lang_en'),
+            InlineKeyboardButton("🇰🇷 한국어", callback_data='lang_ko')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_main_keyboard(user_id):
+    """Asosiy menyu tugmalarini yaratish"""
+    t = lambda key: get_text(user_id, key)
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(t('btn_prices'), callback_data='info_prices'),
+            InlineKeyboardButton(t('btn_universities'), callback_data='info_universities')
+        ],
+        [
+            InlineKeyboardButton(t('btn_study'), callback_data='info_study'),
+            InlineKeyboardButton(t('btn_contact'), callback_data='info_contact')
+        ],
+        [
+            InlineKeyboardButton(t('btn_referral'), callback_data='info_referral'),
+            InlineKeyboardButton(t('btn_settings'), callback_data='settings')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_university_keyboard(user_id):
+    """Universitetlar ro'yxati tugmalarini yaratish"""
+    t = lambda key: get_text(user_id, key)
+    lang = get_user_language(user_id)
+    
+    keyboard = []
+    for uni_key, uni_data in UNIVERSITIES.items():
+        uni_name = uni_data.get(f'name_{lang}', uni_data['name_uz'])
+        keyboard.append([InlineKeyboardButton(uni_name, callback_data=f'uni_{uni_key}')])
+    
+    keyboard.append([InlineKeyboardButton(t('back_to_menu'), callback_data='start')])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_university_detail_keyboard(user_id, uni_key):
+    """Universitet detallar uchun tugmalar"""
+    t = lambda key: get_text(user_id, key)
+    
+    keyboard = [
+        [InlineKeyboardButton(t('btn_location'), callback_data=f'loc_{uni_key}')],
+        [InlineKeyboardButton(t('uni_back_to_list'), callback_data='info_universities')],
+        [InlineKeyboardButton(t('back_to_menu'), callback_data='start')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_keyboard(user_id):
+    """Oddiy orqaga tugma"""
+    t = lambda key: get_text(user_id, key)
+    keyboard = [[InlineKeyboardButton(t('back_to_menu'), callback_data='start')]]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============ SUBSCRIPTION CHECK - OPTIMALLASHTIRILGAN ============
+
+async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Kanal obunasini tekshirish"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Obuna tekshiruvi
+    if await is_subscribed_to_channel(context.bot, user_id, REQUIRED_CHANNEL):
+        return True
+    
+    # Obuna bo'lmasa - Obuna tugmasini yuborish
+    t = lambda key: get_text(user_id, key)
+    
+    keyboard = [
+        [InlineKeyboardButton(t('subscribe_button'), url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")],
+        [InlineKeyboardButton(t('check_subscription'), callback_data='check_sub')]
+    ]
+    
+    await send_message_smart(
+        context,
+        chat_id,
+        t('subscribe_required'),
+        InlineKeyboardMarkup(keyboard)
+    )
+    return False
+
+
+# ============ COMMAND HANDLERS ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start buyrug'i kelganda asosiy menyuni yuboradi."""
+    """/start buyrug'i"""
+    user_id = update.effective_user.id
     user_name = update.effective_user.first_name
-    reply_text = (
-        f"Assalomu alaykum, {user_name}! 👋\n\n"
-        "Men 'Go Korea Consulting' kompaniyasining virtual yordamchisiman. "
-        "Kerakli bo'limni tanlash uchun quyidagi tugmalardan foydalaning."
+    
+    # Chat ID ni aniqlash: Agar Message bo'lsa, update.effective_chat.id; agar CallbackQuery bo'lsa, o'zgartirish kerak.
+    chat_id = update.effective_chat.id
+
+    # Referal kodini tekshirish
+    if update.message and context.args:
+        ref_code = context.args[0].replace('ref_', '')
+        if ref_code != str(user_id):  # O'z kodidan foydalanmasin
+            if str(user_id) not in user_data:
+                # Yangi user, referalni saqlash
+                if str(user_id) not in user_data:
+                    user_data[str(user_id)] = {}
+                user_data[str(user_id)]['referred_by'] = ref_code
+                
+                # Referrer statistikasini yangilash
+                if ref_code not in referral_data:
+                    referral_data[ref_code] = {'invited': 0, 'confirmed': 0, 'discount': 0}
+                referral_data[ref_code]['invited'] += 1
+                referral_data[ref_code]['discount'] += REFERRAL_BONUS['registration']
+                save_user_data()
+    
+    # Til tanlanmaganmi?
+    if str(user_id) not in user_data or 'language' not in user_data[str(user_id)]:
+        # Til tanlash
+        text = "🌍 Tilni tanlang / Choose Language / Выберите язык / 언어를 선택하세요:"
+        await send_message_smart(context, chat_id, text, get_language_keyboard())
+        return
+    
+    # Kanal obunasini tekshirish
+    if not await check_subscription(update, context):
+        return
+    
+    # Asosiy menyu
+    t = lambda key: get_text(user_id, key)
+    welcome_text = t('welcome').format(name=user_name)
+    
+    await send_message_smart(
+        context,
+        chat_id,
+        f"{welcome_text}\n\n{t('main_menu')}",
+        get_main_keyboard(user_id)
     )
-    
-    try:
-        if update.message:
-            chat_id = update.message.chat_id
-            await send_and_track_message(context, chat_id, reply_text, get_main_keyboard())
-        elif update.callback_query:
-            chat_id = update.callback_query.message.chat_id
-            await send_and_track_message(context, chat_id, reply_text, get_main_keyboard())
-    except Exception as e:
-        logger.error(f"Start funksiyasida xatolik: {e}")
-
-
-async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/narxlar buyrug'iga javob beradi."""
-    try:
-        chat_id = update.message.chat_id
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy Menyu", callback_data='start')]])
-        await send_and_track_message(context, chat_id, format_prices_info(), reply_markup)
-    except Exception as e:
-        logger.error(f"cmd_prices xatolik: {e}")
-
-
-async def cmd_universities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/universitetlar buyrug'iga javob beradi."""
-    try:
-        chat_id = update.message.chat_id
-        response = "🎓 **Hamkor Universitetlarimiz**\n\nQaysi universitet haqida ma'lumot kerak?"
-        await send_and_track_message(context, chat_id, response, get_university_keyboard())
-    except Exception as e:
-        logger.error(f"cmd_universities xatolik: {e}")
-
-
-async def cmd_study(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/darslar buyrug'iga javob beradi."""
-    try:
-        chat_id = update.message.chat_id
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy Menyu", callback_data='start')]])
-        await send_and_track_message(context, chat_id, format_study_info(), reply_markup)
-    except Exception as e:
-        logger.error(f"cmd_study xatolik: {e}")
-
-
-# ----------------- MESSAGE HANDLER -----------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Foydalanuvchi yuborgan matnni qabul qiladi va ma'lumotlar bazasi orqali javob beradi."""
-    user_text = update.message.text.lower()
-    chat_id = update.message.chat_id
-    response = ""
-    reply_markup = None
-
-    # Q_A_DATA dan javob qidirish
-    for keyword, answer in Q_A_DATA.items():
-        if keyword in user_text:
-            response = answer
-            break
-    
-    # Agar javob topilmasa
-    if not response:
-        response = "Kechirasiz, men savolingizga hozircha aniq javob bera olmadim. Iltimos, quyidagi asosiy menyu tugmalaridan foydalaning yoki *Aloqa* deb yozing."
-        reply_markup = get_main_keyboard()
-
-    try:
-        await send_and_track_message(context, chat_id, response, reply_markup)
-    except Exception as e:
-        logger.error(f"handle_message xatolik: {e}")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inline tugmalarni bosish hodisalarini boshqaradi."""
+    """Inline tugmalarni bosish hodisalarini boshqaradi"""
     query = update.callback_query
     await query.answer()
 
-    data = query.data
+    user_id = query.from_user.id
     chat_id = query.message.chat_id
+    data = query.data
+    
+    t = lambda key: get_text(user_id, key)
     
     try:
+        # Til tanlash
+        if data.startswith('lang_'):
+            lang = data.replace('lang_', '')
+            set_user_language(user_id, lang)
+            
+            # Referal kod generatsiya qilish
+            if str(user_id) not in user_data or 'referral_code' not in user_data[str(user_id)]:
+                ref_code = generate_referral_code(user_id)
+                if str(user_id) not in user_data:
+                    user_data[str(user_id)] = {}
+                user_data[str(user_id)]['referral_code'] = ref_code
+                save_user_data()
+            
+            # Asosiy menyuni chaqirish
+            # 'start' funksiyasini chaqirish uchun yangi Update obyekti yaratish kerak
+            # yoki alohida funksiya orqali menyuni yuborish kerak.
+            # Eng yaxshisi: quyida 'start_manual' funksiyasini yozdim.
+            await send_main_menu(update, context, t('language_changed'))
+            return
+        
+        # ============ OBUNA TEKSHIRISH MANTIQI - TUZATILDI ============
+        if data == 'check_sub':
+            if await is_subscribed_to_channel(context.bot, user_id, REQUIRED_CHANNEL):
+                # Obuna tasdiqlangan, asosiy menyuni yuboramiz
+                user_name = query.from_user.first_name
+                t = lambda key: get_text(user_id, key)
+                welcome_text = t('welcome').format(name=user_name)
+                
+                await send_message_smart(
+                    context,
+                    chat_id,
+                    f"{t('subscription_confirmed')}\n\n{welcome_text}\n\n{t('main_menu')}",
+                    get_main_keyboard(user_id)
+                )
+                
+            else:
+                # Obuna bo'lmagan
+                # Xabarni tahrirlash (yoki yangi xabar yuborish)
+                await send_message_smart(
+                    context,
+                    chat_id,
+                    t('not_subscribed'), # Hali ham obuna emas
+                    query.message.reply_markup # Obuna tugmasini qayta yuborish
+                )
+            return
+        # =============================================================
+        
+        # Kanal obunasini tekshirish (boshqa tugmalar uchun)
+        # BU QISM Hozirda to'g'ri: Obuna bo'lmasa, obuna tugmasini ko'rsatadi
+        if not await check_subscription(update, context):
+            return
+        
         # Asosiy menyu
         if data == 'start':
-            response = "Bosh menyudasiz. Kerakli bo'limni tanlang."
-            await send_and_track_message(context, chat_id, response, get_main_keyboard())
+            await send_main_menu(update, context) # Menyuni yuboruvchi yordamchi funksiya
         
         # Narxlar
         elif data == 'info_prices':
-            response = format_prices_info()
-            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy Menyu", callback_data='start')]])
-            await send_and_track_message(context, chat_id, response, reply_markup)
+            response = t('prices_title')
+            response += t('prices_advance') + "\n"
+            response += t('prices_advance_amount') + "\n"
+            response += t('prices_advance_terms') + "\n"
+            response += t('prices_final') + "\n"
+            response += t('prices_final_amount') + "\n"
+            response += t('prices_final_terms')
+            response += t('prices_includes')
+            
+            await send_message_smart(context, chat_id, response, get_back_keyboard(user_id))
         
         # Universitetlar ro'yxati
         elif data == 'info_universities':
-            response = "🎓 **Hamkor Universitetlarimiz**\n\nQaysi universitet haqida ma'lumot kerak?"
-            await send_and_track_message(context, chat_id, response, get_university_keyboard())
+            response = t('universities_title')
+            await send_message_smart(context, chat_id, response, get_university_keyboard(user_id))
         
         # Til kurslari
         elif data == 'info_study':
-            response = format_study_info()
-            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy Menyu", callback_data='start')]])
-            await send_and_track_message(context, chat_id, response, reply_markup)
+            await send_message_smart(context, chat_id, t('study_info'), get_back_keyboard(user_id))
         
-        # Aloqa
+        # Aloqa - TUZATILGAN!
         elif data == 'info_contact':
-            response = Q_A_DATA.get('aloqa', 'Aloqa ma\'lumotlari topilmadi.')
-            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy Menyu", callback_data='start')]])
-            await send_and_track_message(context, chat_id, response, reply_markup)
+            lang = get_user_language(user_id)
+            response = format_contact_info(CONTACT_INFO, lang)
+            await send_message_smart(context, chat_id, response, get_back_keyboard(user_id))
         
-        # Universitet tanlanganda (rasm bilan)
+        # Referal
+        elif data == 'info_referral':
+            ref_code = user_data.get(str(user_id), {}).get('referral_code', 'ERROR')
+            ref_stats = referral_data.get(ref_code, {'invited': 0, 'confirmed': 0, 'discount': 0})
+            
+            bot_username = (await context.bot.get_me()).username
+            ref_link = f"https://t.me/{bot_username}?start=ref_{ref_code}"
+            
+            response = t('referral_info').format(
+                code=ref_code,
+                invited=ref_stats['invited'],
+                confirmed=ref_stats['confirmed'],
+                discount=ref_stats['discount'],
+                link=ref_link
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton(t('referral_share'), url=f"https://t.me/share/url?url={ref_link}&text=Go Korea bilan Koreada o'qing!")],
+                [InlineKeyboardButton(t('back_to_menu'), callback_data='start')]
+            ]
+            await send_message_smart(context, chat_id, response, InlineKeyboardMarkup(keyboard))
+        
+        # Sozlamalar
+        elif data == 'settings':
+            keyboard = [
+                [InlineKeyboardButton(t('btn_change_language'), callback_data='change_lang')],
+                [InlineKeyboardButton(t('back_to_menu'), callback_data='start')]
+            ]
+            await send_message_smart(context, chat_id, t('settings_menu'), InlineKeyboardMarkup(keyboard))
+        
+        elif data == 'change_lang':
+            await send_message_smart(context, chat_id, t('choose_language'), get_language_keyboard())
+        
+        # Universitet tanlash
         elif data.startswith('uni_'):
-            uni_name = data.replace('uni_', '')
-            if uni_name in UNIVERSITY_INFO:
-                uni_data = UNIVERSITY_INFO[uni_name]
+            uni_key = data.replace('uni_', '')
+            if uni_key in UNIVERSITIES:
+                uni_data = UNIVERSITIES[uni_key]
+                lang = get_user_language(user_id)
                 
-                # Rasm yo'lini aniqlash
-                image_filename = uni_data.get('rasm_fayli', 'default.jpg')
-                image_path = os.path.join(IMAGE_DIR, image_filename)
+                # Ma'lumotni formatlash
+                uni_name = uni_data.get(f'name_{lang}', uni_data['name_uz'])
+                programs = "\n".join(uni_data.get(f'programs_{lang}', uni_data['programs_uz']))
+                advantages = "\n".join(uni_data.get(f'advantages_{lang}', uni_data['advantages_uz']))
+                description = uni_data.get(f'description_{lang}', uni_data['description_uz'])
+                admission = uni_data.get(f'admission_{lang}', uni_data['admission_uz'])
+
                 
-                caption = format_uni_info(uni_name)
-                reply_markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Universitetlar Ro'yxati", callback_data='info_universities')],
-                    [InlineKeyboardButton("🏠 Asosiy Menyu", callback_data='start')]
-                ])
+                caption = t('uni_info_template').format(
+                    name=uni_name,
+                    city=uni_data['city'],
+                    price=uni_data['price'],
+                    founded=uni_data['founded'],
+                    students=uni_data['students'],
+                    description=description,
+                    programs=programs,
+                    dormitory=uni_data['dormitory'],
+                    advantages=advantages,
+                    admission=admission
+                )
                 
                 # Rasmni yuborish
-                await send_and_track_message(
-                    context, 
-                    chat_id, 
-                    caption, 
-                    reply_markup, 
+                image_path = os.path.join(IMAGE_DIR, uni_data['rasm_fayli'])
+                await send_message_smart(
+                    context,
+                    chat_id,
+                    caption,
+                    get_university_detail_keyboard(user_id, uni_key),
                     image_path if os.path.exists(image_path) else None
                 )
-            else:
-                response = "Kechirasiz, bu universitet haqida ma'lumot topilmadi."
-                await send_and_track_message(context, chat_id, response, get_main_keyboard())
+        
+        # Joylashuv
+        elif data.startswith('loc_'):
+            uni_key = data.replace('loc_', '')
+            if uni_key in UNIVERSITIES:
+                location = UNIVERSITIES[uni_key]['location']
+                lang = get_user_language(user_id)
+                
+                # Tilga mos ma'lumotlarni olish
+                city_description = location.get(f'city_description_{lang}', location['city_description_uz'])
+                climate = location.get(f'climate_{lang}', location['climate_uz'])
+                transport = location.get(f'transport_{lang}', location['transport_uz'])
+                cost = location.get(f'monthly_cost_{lang}', location['monthly_cost_uz'])
+
+
+                response = t('location_template').format(
+                    city=UNIVERSITIES[uni_key]['city'],
+                    description=city_description,
+                    climate=climate,
+                    transport=transport,
+                    cost=cost,
+                    address=location['address']
+                )
+                
+                keyboard = [
+                    [InlineKeyboardButton("📍 Google Maps", url=location['google_maps'])],
+                    [InlineKeyboardButton(t('uni_back_to_list'), callback_data='info_universities')],
+                    [InlineKeyboardButton(t('back_to_menu'), callback_data='start')]
+                ]
+                await send_message_smart(context, chat_id, response, InlineKeyboardMarkup(keyboard))
     
     except Exception as e:
         logger.error(f"button_handler xatolik: {e}")
-        try:
-            await send_and_track_message(
-                context,
-                chat_id,
-                "Xatolik yuz berdi. Iltimos, qaytadan urinib ko'ring.",
-                get_main_keyboard()
-            )
-        except:
-            pass
+        await send_message_smart(
+            context,
+            chat_id,
+            t('error_occurred'),
+            get_main_keyboard(user_id)
+        )
 
+
+async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_before: str = None) -> None:
+    """Asosiy menyuni yuborish uchun yordamchi funksiya"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    user_name = update.effective_user.first_name
+    
+    t = lambda key: get_text(user_id, key)
+    welcome_text = t('welcome').format(name=user_name)
+    
+    final_text = ""
+    if message_before:
+        final_text += f"{message_before}\n\n"
+        
+    final_text += f"{welcome_text}\n\n{t('main_menu')}"
+    
+    await send_message_smart(
+        context,
+        chat_id,
+        final_text,
+        get_main_keyboard(user_id)
+    )
+
+async def set_bot_commands(application: Application):
+    """Bot buyruqlarini o'rnatish"""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Botni ishga tushirish / Asosiy menyu")
+    ])
 
 def main() -> None:
-    """Botni ishga tushirish uchun asosiy funksiya."""
+    """Botni ishga tushirish"""
     
-    application = Application.builder().token(TOKEN).build()
+    # Ma'lumotlarni yuklash
+    load_user_data()
     
-    # Command handlers
+    application = Application.builder().token(BOT_TOKEN).post_init(set_bot_commands).build()
+    
+    # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("narxlar", cmd_prices))
-    application.add_handler(CommandHandler("universitetlar", cmd_universities))
-    application.add_handler(CommandHandler("darslar", cmd_study))
-
-    # Callback query handler
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     # Botni ishga tushirish
-    logger.info("✅ Bot ishga tushdi...")
+    logger.info("✅ Go Korea Bot ishga tushdi...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
